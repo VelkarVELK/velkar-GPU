@@ -26,6 +26,8 @@ pub struct State {
     block: Option<RpcBlock>,
     pre_pow_hash: Uint256,
     timestamp: u64,
+    nonce_mask: u64,
+    nonce_fixed: u64,
     // PRE_POW_HASH || TIME || 32 zero byte padding; without NONCE
     hasher: PowHasher,
 }
@@ -46,7 +48,17 @@ impl State {
         let mut hasher = HeaderHasher::new();
         serialize_header(&mut hasher, header, true);
         let pre_pow_hash = hasher.finalize();
-        Ok(Self::from_components(id, None, pre_pow_hash, header.timestamp as u64, target, target, Some(block)))
+        Ok(Self::from_components(
+            id,
+            None,
+            pre_pow_hash,
+            header.timestamp as u64,
+            target,
+            target,
+            Some(block),
+            u64::MAX,
+            0,
+        ))
     }
 
     #[inline]
@@ -57,8 +69,20 @@ impl State {
         timestamp: u64,
         block_target: Uint256,
         share_target: Uint256,
+        nonce_mask: u64,
+        nonce_fixed: u64,
     ) -> Self {
-        Self::from_components(id, Some(job_id), pre_pow_hash, timestamp, block_target, share_target, None)
+        Self::from_components(
+            id,
+            Some(job_id),
+            pre_pow_hash,
+            timestamp,
+            block_target,
+            share_target,
+            None,
+            nonce_mask,
+            nonce_fixed,
+        )
     }
 
     #[inline]
@@ -70,11 +94,41 @@ impl State {
         block_target: Uint256,
         share_target: Uint256,
         block: Option<RpcBlock>,
+        nonce_mask: u64,
+        nonce_fixed: u64,
     ) -> Self {
         let hasher = PowHasher::new(pre_pow_hash, timestamp);
         let matrix = Matrix::generate(pre_pow_hash);
 
-        Self { _id: id, job_id, matrix, nonce: 0, block_target, share_target, block, pre_pow_hash, timestamp, hasher }
+        Self {
+            _id: id,
+            job_id,
+            matrix,
+            nonce: 0,
+            block_target,
+            share_target,
+            block,
+            pre_pow_hash,
+            timestamp,
+            nonce_mask,
+            nonce_fixed,
+            hasher,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn nonce_mask(&self) -> u64 {
+        self.nonce_mask
+    }
+
+    #[inline(always)]
+    pub(crate) fn nonce_fixed(&self) -> u64 {
+        self.nonce_fixed
+    }
+
+    #[inline(always)]
+    pub(crate) fn apply_extranonce(&self, nonce: u64) -> u64 {
+        (nonce & self.nonce_mask) | self.nonce_fixed
     }
 
     #[inline(always)]
@@ -393,8 +447,16 @@ mod tests {
         let block_target = u256_from_be_hex("00003d647c000000000000000000000000000000000000000000000000000000");
         let share_target = u256_from_be_hex("0003fffc00000000000000000000000000000000000000000000000000000000");
 
-        let mut state =
-            super::State::from_stratum(0, "1".to_string(), pre_pow_hash, timestamp, block_target, share_target);
+        let mut state = super::State::from_stratum(
+            0,
+            "1".to_string(),
+            pre_pow_hash,
+            timestamp,
+            block_target,
+            share_target,
+            u64::MAX,
+            0,
+        );
         state.nonce = nonce;
 
         let stage1 = state.hasher.finalize_with_nonce(state.nonce);

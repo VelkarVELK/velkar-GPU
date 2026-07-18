@@ -19,6 +19,8 @@ pub struct StratumHandler {
     worker_name: String,
     request_id: AtomicU64,
     current_difficulty: Option<String>,
+    nonce_mask: u64,
+    nonce_fixed: u64,
 }
 
 impl StratumHandler {
@@ -54,6 +56,8 @@ impl StratumHandler {
             worker_name: mining_address.clone(),
             request_id: AtomicU64::new(1),
             current_difficulty: None,
+            nonce_mask: u64::MAX,
+            nonce_fixed: 0,
         };
 
         let user_agent = match user_agent_suffix {
@@ -155,8 +159,11 @@ impl StratumHandler {
                         self.current_difficulty = Some(diff.clone());
                     }
                 }
-                "set_extranonce" => {
-                    info!("Received extranonce parameters from stratum");
+                "set_extranonce" | "mining.set_extranonce" => {
+                    let params = value.get("params").and_then(Value::as_array).ok_or("missing extranonce parameters")?;
+                    let extranonce = params.first().and_then(Value::as_str).ok_or("missing extranonce1")?;
+                    let nonce_size = params.get(1).and_then(Value::as_u64).ok_or("missing extranonce2 size")? as u32;
+                    self.set_extranonce(extranonce, nonce_size)?;
                 }
                 "mining.notify" => {
                     let Some(params) = value.get("params").and_then(Value::as_array) else {
@@ -230,7 +237,15 @@ impl StratumHandler {
                         if job_share_target.is_some() { "job" } else { "difficulty" }
                     );
 
-                    miner.process_job(job_id.to_string(), pre_pow_hash, timestamp, block_target, share_target);
+                    miner.process_job(
+                        job_id.to_string(),
+                        pre_pow_hash,
+                        timestamp,
+                        block_target,
+                        share_target,
+                        self.nonce_mask,
+                        self.nonce_fixed,
+                    );
                 }
                 _ => {}
             }
@@ -238,11 +253,42 @@ impl StratumHandler {
             warn!("Stratum error: {}", value["error"]);
         } else if value.get("result").is_some() {
             let result = &value["result"];
-            if result == true {
+            if let Some(result) = result.as_array() {
+                if let (Some(extranonce), Some(nonce_size)) =
+                    (result.get(1).and_then(Value::as_str), result.get(2).and_then(Value::as_u64))
+                {
+                    self.set_extranonce(extranonce, nonce_size as u32)?;
+                }
+            } else if result == true {
                 info!("Share accepted by stratum pool");
             }
         }
 
+        Ok(())
+    }
+
+    fn set_extranonce(&mut self, extranonce: &str, nonce_size: u32) -> Result<(), Error> {
+        let free_bits = nonce_size.checked_mul(8).ok_or("invalid extranonce2 size")?;
+        if free_bits > 64 {
+            return Err("extranonce2 is larger than the 64-bit Velkar nonce".into());
+        }
+
+        let extranonce = extranonce.trim_start_matches("0x");
+        let fixed = if extranonce.is_empty() { 0 } else { u64::from_str_radix(extranonce, 16)? };
+        let fixed_bits = extranonce.len() as u32 * 4;
+        if fixed_bits + free_bits > 64 {
+            return Err("extranonce1 and extranonce2 exceed the 64-bit Velkar nonce".into());
+        }
+
+        self.nonce_mask = if free_bits == 64 { u64::MAX } else { (1u64 << free_bits) - 1 };
+        self.nonce_fixed = fixed << free_bits;
+        info!(
+            "Stratum extranonce configured: extranonce1={} extranonce2_size={} nonce_mask={:016x} nonce_fixed={:016x}",
+            extranonce,
+            nonce_size,
+            self.nonce_mask,
+            self.nonce_fixed
+        );
         Ok(())
     }
 }
@@ -262,4 +308,30 @@ fn parse_target_hex(value: Option<&Value>) -> Option<crate::target::Uint256> {
     }
 
     Some(crate::target::Uint256::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rplant_extranonce_is_placed_in_high_nonce_bytes() {
+        let (writer, _) = mpsc::channel(1);
+        let (submit_tx, _) = mpsc::channel(1);
+        let mut handler = StratumHandler {
+            writer,
+            submit_tx,
+            worker_name: "test".to_string(),
+            request_id: AtomicU64::new(1),
+            current_difficulty: None,
+            nonce_mask: u64::MAX,
+            nonce_fixed: 0,
+        };
+
+        handler.set_extranonce("fe93", 6).unwrap();
+
+        assert_eq!(handler.nonce_mask, 0x0000_ffff_ffff_ffff);
+        assert_eq!(handler.nonce_fixed, 0xfe93_0000_0000_0000);
+        assert_eq!((0x0fad_665a_2fb9_291b & handler.nonce_mask) | handler.nonce_fixed, 0xfe93_665a_2fb9_291b);
+    }
 }

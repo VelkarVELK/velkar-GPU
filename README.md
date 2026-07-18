@@ -24,7 +24,7 @@ Windows releases may contain two executables:
 
 | File | Intended hardware |
 | --- | --- |
-| `velkar-cpuminer.exe` | CPU and AMD/OpenCL |
+| `velkar-amd.exe` | CPU and AMD/OpenCL |
 | `velkar-cudaminer.exe` | NVIDIA/CUDA |
 
 The CUDA executable contains embedded Velkar PTX. Miners only need a compatible,
@@ -95,6 +95,10 @@ target/release/velkar-cpuminer
 
 The value passed to `--mining-address` is the pool username or worker name when
 using Stratum.
+
+The miner supports Stratum extranonce negotiation. Pools that provide
+`set_extranonce` or `mining.set_extranonce` have their assigned `extranonce1`
+embedded in every submitted 64-bit nonce.
 
 ### CPU
 
@@ -190,6 +194,9 @@ allows unsynced block submission.
 VelkarHash uses approximately **8 MiB of VRAM per job**. Workload controls how
 many nonces are processed in each GPU dispatch. It is not a difficulty setting.
 
+If `--cuda-workload` is omitted, the default workload is `128`. Explicit values
+are still reduced automatically when they exceed the detected safe memory limit.
+
 Both GPU backends now scale dynamically instead of enforcing the old fixed
 limit of 256 jobs:
 
@@ -228,7 +235,7 @@ Suggested starting points:
 | 6-8 GB | `128`, `256`, `384` |
 | 10-12 GB | `256`, `512`, `768` |
 | 16 GB | `256`, `512`, `768`, `1024` |
-| 24 GB | `512`, `768`, `1024`, `1536` |
+| 24 GB | `512`, `768`, `1024`, `1280` |
 | 32 GB or more | `512`, `1024`, `1536`, `2048` |
 
 A very large workload can reduce effective pool performance because the GPU may

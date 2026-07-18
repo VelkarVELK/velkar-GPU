@@ -234,8 +234,8 @@ impl OpenClSearcher {
     fn prepare_jobs(&mut self, state: &pow::State, nonce_base: u64) -> Result<(), Error> {
         unsafe {
             let input_per_job = JOB_INPUT_BYTES as u64;
-            let nonce_mask = u64::MAX;
-            let nonce_fixed = 0u64;
+            let nonce_mask = state.nonce_mask();
+            let nonce_fixed = state.nonce_fixed();
             let target = state.block_target().to_le_u64();
             self.prepare_kernel.set_arg(0, &self.job_inputs_buffer).map_err(|e| e.to_string())?;
             self.prepare_kernel.set_arg(1, &self.constants_buffer).map_err(|e| e.to_string())?;
@@ -539,6 +539,16 @@ pub enum GpuBackend {
     OpenCl,
     #[cfg(feature = "cuda")]
     Cuda,
+}
+
+impl GpuBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::OpenCl => "OpenCL",
+            #[cfg(feature = "cuda")]
+            Self::Cuda => "CUDA",
+        }
+    }
 }
 
 pub enum GpuSearcher {

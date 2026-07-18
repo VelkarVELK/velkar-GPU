@@ -9,6 +9,7 @@ use log::{debug, info};
 
 const ARGON_MEMORY_KIB: usize = 8 * 1024;
 const ARGON2_BLOCK_BYTES: usize = 1024;
+const ARGON2_SYNC_POINTS: usize = 4;
 const MEMORY_PER_JOB: usize = ARGON_MEMORY_KIB * ARGON2_BLOCK_BYTES;
 const JOB_INPUT_BYTES: usize = 72 + 16 + 8 + 32 + 32 + 32;
 const CONSTANTS_BYTES: usize = 72 + 64 * 64 * 2;
@@ -22,6 +23,7 @@ pub struct CudaSearcher {
     job_inputs: DeviceBuffer<u8>,
     stage4: DeviceBuffer<u8>,
     nonces: DeviceBuffer<u64>,
+    refs: DeviceBuffer<u8>,
     shuffle_scratch: DeviceBuffer<u8>,
     batch_size: usize,
     validation_done: bool,
@@ -60,9 +62,28 @@ impl CudaSearcher {
         let job_inputs = DeviceBuffer::<u8>::zeroed(JOB_INPUT_BYTES * batch_size)?;
         let stage4 = DeviceBuffer::<u8>::zeroed(32 * batch_size)?;
         let nonces = DeviceBuffer::<u64>::zeroed(batch_size)?;
+        let segment_blocks = ARGON_MEMORY_KIB / ARGON2_SYNC_POINTS;
+        let refs_per_address_block = ARGON2_BLOCK_BYTES / (2 * std::mem::size_of::<u32>());
+        let address_blocks = (segment_blocks + refs_per_address_block - 1) / refs_per_address_block;
+        let reference_segments = ARGON2_SYNC_POINTS / 2;
+        let refs_bytes = reference_segments * address_blocks * refs_per_address_block * 2 * std::mem::size_of::<u32>();
+        let refs = DeviceBuffer::<u8>::zeroed(refs_bytes)?;
         // CUDA shuffle uses warp intrinsics. This pointer only preserves the shared
         // OpenCL/CUDA kernel ABI and is intentionally not read by the CUDA path.
         let shuffle_scratch = DeviceBuffer::<u8>::zeroed(256)?;
+
+        let precompute = module.get_function("argon2_precompute_kernel")?;
+        unsafe {
+            launch!(precompute<<<(reference_segments as u32 * address_blocks as u32, 1, 1), (32, 1, 1), 0, stream>>>(
+                shuffle_scratch.as_device_ptr(),
+                refs.as_device_ptr(),
+                1u32,
+                1u32,
+                segment_blocks as u32
+            ))?;
+        }
+        stream.synchronize()?;
+        info!("CUDA Argon2 reference table generated and ready");
 
         info!(
             "CUDA GPU selected: {name} (device #{device_index}, {} MiB VRAM)",
@@ -84,6 +105,7 @@ impl CudaSearcher {
             job_inputs,
             stage4,
             nonces,
+            refs,
             shuffle_scratch,
             batch_size,
             validation_done: false,
@@ -108,7 +130,7 @@ impl CudaSearcher {
         let target = state.block_target().to_le_u64();
         let prepare = self.module.get_function("velkar_prepare_jobs")?;
         let init = self.module.get_function("velkar_init_first_blocks")?;
-        let argon = self.module.get_function("argon2_kernel_oneshot")?;
+        let argon = self.module.get_function("argon2_kernel_oneshot_precompute")?;
         let export = self.module.get_function("velkar_export_stage4")?;
         // The OpenCL-derived helper kernels do not receive a batch-length
         // argument. Select an exact divisor so CUDA never launches an
@@ -127,8 +149,8 @@ impl CudaSearcher {
                 self.constants.as_device_ptr(),
                 JOB_INPUT_BYTES as u64,
                 nonce_base,
-                u64::MAX,
-                0u64,
+                state.nonce_mask(),
+                state.nonce_fixed(),
                 target[0], target[1], target[2], target[3]
             ))?;
             launch!(init<<<grid_1d, block_1d, 0, stream>>>(
@@ -141,6 +163,7 @@ impl CudaSearcher {
             launch!(argon<<<(1, self.batch_size as u32, 1), (32, 1, 1), 0, stream>>>(
                 self.shuffle_scratch.as_device_ptr(),
                 self.memory.as_device_ptr(),
+                self.refs.as_device_ptr(),
                 1u32,
                 1u32,
                 (ARGON_MEMORY_KIB / 4) as u32
