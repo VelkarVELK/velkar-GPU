@@ -1,11 +1,12 @@
 use crate::{
+    gpu::{GpuConfig, GpuHit, GpuSearcher},
     pow,
     proto::{RpcBlock, VelkardMessage},
     stratum::StratumCommand,
     swap_rust::WatchSwap,
     Error, ShutdownHandler,
 };
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::{thread_rng, RngCore};
 use std::{
     num::Wrapping,
@@ -47,15 +48,40 @@ pub struct StratumMinerManager {
     last_share_submit_ms: Arc<AtomicU64>,
 }
 
+pub trait StratumJobSink {
+    fn process_job(
+        &mut self,
+        job_id: String,
+        pre_pow_hash: crate::Hash,
+        timestamp: u64,
+        block_target: crate::Hash,
+        share_target: crate::Hash,
+    );
+}
+
 impl Drop for MinerManager {
     fn drop(&mut self) {
         self.logger_handle.abort();
+        for handle in self.handles.drain(..) {
+            if handle.is_finished() {
+                if let Err(e) = handle.join().unwrap_or_else(|_| Err("miner thread panicked".into())) {
+                    warn!("Miner worker exited: {e}");
+                }
+            }
+        }
     }
 }
 
 impl Drop for StratumMinerManager {
     fn drop(&mut self) {
         self.logger_handle.abort();
+        for handle in self.handles.drain(..) {
+            if handle.is_finished() {
+                if let Err(e) = handle.join().unwrap_or_else(|_| Err("stratum miner thread panicked".into())) {
+                    warn!("Stratum miner worker exited: {e}");
+                }
+            }
+        }
     }
 }
 
@@ -72,6 +98,7 @@ impl MinerManager {
         send_channel: Sender<VelkardMessage>,
         n_cpus: Option<u16>,
         throttle: Option<Duration>,
+        gpu_config: Option<GpuConfig>,
         shutdown: ShutdownHandler,
     ) -> Self {
         let hashes_tried = Arc::new(AtomicU64::new(0));
@@ -82,6 +109,7 @@ impl MinerManager {
             hashes_tried.clone(),
             solved_state_id.clone(),
             watch.clone(),
+            gpu_config,
             shutdown,
             n_cpus,
             throttle,
@@ -105,18 +133,24 @@ impl MinerManager {
         hashes_tried: Arc<AtomicU64>,
         solved_state_id: Arc<AtomicUsize>,
         work_channel: WatchSwap<pow::State>,
+        gpu_config: Option<GpuConfig>,
         shutdown: ShutdownHandler,
         n_cpus: Option<u16>,
         throttle: Option<Duration>,
     ) -> impl Iterator<Item = MinerHandler> {
-        let n_cpus = get_num_cpus(n_cpus);
-        info!("Launching: {} cpu miners", n_cpus);
+        let n_cpus = if gpu_config.is_some() { 1 } else { get_num_cpus(n_cpus) };
+        if gpu_config.is_some() {
+            info!("Launching: 1 OpenCL miner worker");
+        } else {
+            info!("Launching: {} cpu miners", n_cpus);
+        }
         (0..n_cpus).map(move |_| {
             Self::launch_cpu_miner(
                 send_channel.clone(),
                 work_channel.clone(),
                 hashes_tried.clone(),
                 solved_state_id.clone(),
+                gpu_config.clone(),
                 throttle,
                 shutdown.clone(),
             )
@@ -149,6 +183,7 @@ impl MinerManager {
         mut block_channel: WatchSwap<pow::State>,
         hashes_tried: Arc<AtomicU64>,
         solved_state_id: Arc<AtomicUsize>,
+        gpu_config: Option<GpuConfig>,
         throttle: Option<Duration>,
         shutdown: ShutdownHandler,
     ) -> MinerHandler {
@@ -171,10 +206,23 @@ impl MinerManager {
 
         let mut nonce = Wrapping(thread_rng().next_u64());
         std::thread::spawn(move || {
+            let mut gpu = match gpu_config {
+                Some(cfg) => Some(GpuSearcher::new(&cfg)?),
+                None => None,
+            };
+            if gpu.is_some() {
+                info!("{} mining thread started", gpu.as_ref().expect("GPU exists").name());
+            }
             let mut state = None;
             loop {
                 if state.is_none() {
+                    if gpu.is_some() {
+                        info!("OpenCL miner waiting for block template");
+                    }
                     state = block_channel.wait_for_change().as_deref().cloned();
+                    if gpu.is_some() {
+                        info!("OpenCL miner received block template");
+                    }
                 }
                 let Some(state_ref) = state.as_mut() else {
                     continue;
@@ -184,27 +232,51 @@ impl MinerManager {
                     state = block_channel.wait_for_change().as_deref().cloned();
                     continue;
                 }
-                state_ref.nonce = nonce.0;
+                if let Some(gpu) = gpu.as_mut() {
+                    let hits = match gpu.search(state_ref, nonce.0, state_ref.block_target()) {
+                        Ok(hits) => hits,
+                        Err(e) => {
+                            warn!("OpenCL search failed: {e}");
+                            if shutdown.is_shutdown() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                    };
+                    let batch = gpu.batch_size() as u64;
+                    nonce += Wrapping(batch);
+                    hashes_tried.fetch_add(batch, Ordering::Relaxed);
 
-                if let Some(block) = state_ref.generate_block_if_pow() {
-                    found_block(&send_channel, block, state_ref._id, &solved_state_id)?;
-                    state = None;
-                    continue;
-                }
-                nonce += Wrapping(1);
-
-                if nonce.0.is_multiple_of(128) {
-                    hashes_tried.fetch_add(128, Ordering::Relaxed);
-                    if shutdown.is_shutdown() {
-                        return Ok(());
+                    if let Some(hit) = hits.into_iter().next() {
+                        state_ref.nonce = hit.nonce;
+                        if let Some(block) = state_ref.generate_block_if_pow() {
+                            found_block(&send_channel, block, state_ref._id, &solved_state_id)?;
+                            state = None;
+                        }
                     }
-                    if let Some(new_state) = block_channel.get_changed() {
-                        state = new_state.as_deref().cloned();
-                    }
-                }
+                } else {
+                    state_ref.nonce = nonce.0;
 
-                if let Some(sleep_duration) = throttle {
-                    std::thread::sleep(sleep_duration)
+                    if let Some(block) = state_ref.generate_block_if_pow() {
+                        found_block(&send_channel, block, state_ref._id, &solved_state_id)?;
+                        state = None;
+                        continue;
+                    }
+                    nonce += Wrapping(1);
+
+                    if nonce.0.is_multiple_of(128) {
+                        hashes_tried.fetch_add(128, Ordering::Relaxed);
+                        if shutdown.is_shutdown() {
+                            return Ok(());
+                        }
+                        if let Some(new_state) = block_channel.get_changed() {
+                            state = new_state.as_deref().cloned();
+                        }
+                    }
+
+                    if let Some(sleep_duration) = throttle {
+                        std::thread::sleep(sleep_duration)
+                    }
                 }
             }
         })
@@ -219,7 +291,7 @@ impl MinerManager {
             let hashes = hashes_tried.swap(0, Ordering::Relaxed);
             let rate = (hashes as f64) / (now - last_instant).as_secs_f64();
             if hashes == 0 && i % 2 == 0 {
-                warn!("Velkard is still not synced");
+                warn!("No hashes were processed in the last interval");
             } else if hashes != 0 {
                 let (rate, suffix) = Self::hash_suffix(rate);
                 info!("Current hashrate is: {:.2} {}", rate, suffix);
@@ -246,6 +318,7 @@ impl StratumMinerManager {
         send_channel: Sender<StratumCommand>,
         n_cpus: Option<u16>,
         throttle: Option<Duration>,
+        gpu_config: Option<GpuConfig>,
         shutdown: ShutdownHandler,
     ) -> Self {
         let hashes_tried = Arc::new(AtomicU64::new(0));
@@ -256,6 +329,7 @@ impl StratumMinerManager {
             hashes_tried.clone(),
             last_share_submit_ms.clone(),
             watch.clone(),
+            gpu_config,
             shutdown,
             n_cpus,
             throttle,
@@ -278,18 +352,24 @@ impl StratumMinerManager {
         hashes_tried: Arc<AtomicU64>,
         last_share_submit_ms: Arc<AtomicU64>,
         work_channel: WatchSwap<pow::State>,
+        gpu_config: Option<GpuConfig>,
         shutdown: ShutdownHandler,
         n_cpus: Option<u16>,
         throttle: Option<Duration>,
     ) -> impl Iterator<Item = MinerHandler> {
-        let n_cpus = get_num_cpus(n_cpus);
-        info!("Launching: {} cpu miners", n_cpus);
+        let n_cpus = if gpu_config.is_some() { 1 } else { get_num_cpus(n_cpus) };
+        if gpu_config.is_some() {
+            info!("Launching: 1 OpenCL miner worker");
+        } else {
+            info!("Launching: {} cpu miners", n_cpus);
+        }
         (0..n_cpus).map(move |_| {
             Self::launch_cpu_miner(
                 send_channel.clone(),
                 work_channel.clone(),
                 hashes_tried.clone(),
                 last_share_submit_ms.clone(),
+                gpu_config.clone(),
                 throttle,
                 shutdown.clone(),
             )
@@ -314,6 +394,7 @@ impl StratumMinerManager {
         mut job_channel: WatchSwap<pow::State>,
         hashes_tried: Arc<AtomicU64>,
         last_share_submit_ms: Arc<AtomicU64>,
+        gpu_config: Option<GpuConfig>,
         throttle: Option<Duration>,
         shutdown: ShutdownHandler,
     ) -> MinerHandler {
@@ -336,6 +417,7 @@ impl StratumMinerManager {
             send_channel: &Sender<StratumCommand>,
             state: &pow::State,
             last_share_submit_ms: &AtomicU64,
+            pow: crate::target::Uint256,
         ) -> Result<(), Error> {
             if !should_submit_share(last_share_submit_ms) {
                 return Ok(());
@@ -344,7 +426,6 @@ impl StratumMinerManager {
             let job_id = state.job_id.clone().ok_or("missing stratum job id")?;
             let nonce = format!("{:016x}", state.nonce);
             send_channel.blocking_send(StratumCommand::SubmitShare { job_id, nonce: nonce.clone() })?;
-            let pow = state.calculate_pow();
             info!(
                 "Found a share: {} pow={} share_target={} block_target={}",
                 nonce,
@@ -357,38 +438,314 @@ impl StratumMinerManager {
 
         let mut nonce = Wrapping(thread_rng().next_u64());
         std::thread::spawn(move || {
+            let mut gpu = match gpu_config {
+                Some(cfg) => Some(GpuSearcher::new(&cfg)?),
+                None => None,
+            };
+            if gpu.is_some() {
+                info!("OpenCL stratum mining thread started");
+            }
             let mut state = None;
             loop {
                 if state.is_none() {
+                    if gpu.is_some() {
+                        info!("OpenCL stratum miner waiting for job");
+                    }
                     state = job_channel.wait_for_change().as_deref().cloned();
+                    if let Some(s) = state.as_ref() {
+                        if gpu.is_some() {
+                            info!("OpenCL stratum miner received job {}", s.job_id.as_deref().unwrap_or("<rpc>"));
+                        }
+                    }
                 }
                 let Some(state_ref) = state.as_mut() else {
                     continue;
                 };
 
-                state_ref.nonce = nonce.0;
-                match state_ref.pow_match() {
-                    pow::PowMatch::Block | pow::PowMatch::Share => {
-                        // In stratum mode the pool is the source of truth for block-vs-share
-                        // validation. The miner only filters against the announced share target.
-                        found_share(&send_channel, state_ref, &last_share_submit_ms)?;
-                    }
-                    pow::PowMatch::None => {}
-                }
-                nonce += Wrapping(1);
-
-                if nonce.0.is_multiple_of(128) {
-                    hashes_tried.fetch_add(128, Ordering::Relaxed);
-                    if shutdown.is_shutdown() {
-                        return Ok(());
-                    }
+                if let Some(gpu) = gpu.as_mut() {
                     if let Some(new_state) = job_channel.get_changed() {
-                        state = new_state.as_deref().cloned();
+                        if let Some(new_state) = new_state.as_deref().cloned() {
+                            debug!(
+                                "OpenCL stratum miner switched to latest job {}",
+                                new_state.job_id.as_deref().unwrap_or("<rpc>")
+                            );
+                            state = Some(new_state);
+                        }
+                    }
+                    let Some(state_ref) = state.as_mut() else {
+                        continue;
+                    };
+                    debug!("OpenCL stratum miner dispatching batch at nonce {}", nonce.0);
+                    let hits = match gpu.search(state_ref, nonce.0, state_ref.share_target()) {
+                        Ok(hits) => hits,
+                        Err(e) => {
+                            warn!("OpenCL search failed: {e}");
+                            if shutdown.is_shutdown() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                    };
+                    debug!("OpenCL stratum miner completed batch with {} matching share(s)", hits.len());
+                    let batch = gpu.batch_size() as u64;
+                    nonce += Wrapping(batch);
+                    hashes_tried.fetch_add(batch, Ordering::Relaxed);
+                    if hits.is_empty() {
+                        debug!(
+                            "OpenCL batch completed without share candidates for job {}",
+                            state_ref.job_id.as_deref().unwrap_or("<rpc>")
+                        );
+                    }
+                    for hit in hits {
+                        state_ref.nonce = hit.nonce;
+                        let consensus_pow = state_ref.calculate_pow();
+                        if consensus_pow <= state_ref.share_target() {
+                            found_share(&send_channel, state_ref, &last_share_submit_ms, consensus_pow)?;
+                        } else {
+                            debug!(
+                                "OpenCL stage4 candidate rejected by full consensus check: nonce={:016x} gpu_pow={} consensus_pow={} share_target={}",
+                                hit.nonce,
+                                hit.pow.to_be_hex(),
+                                consensus_pow.to_be_hex(),
+                                state_ref.share_target().to_be_hex()
+                            );
+                        }
+                    }
+                } else {
+                    state_ref.nonce = nonce.0;
+                    match state_ref.pow_match() {
+                        pow::PowMatch::Block | pow::PowMatch::Share => {
+                            // In stratum mode the pool is the source of truth for block-vs-share
+                            // validation. The miner only filters against the announced share target.
+                            let pow = state_ref.calculate_pow();
+                            found_share(&send_channel, state_ref, &last_share_submit_ms, pow)?;
+                        }
+                        pow::PowMatch::None => {}
+                    }
+                    nonce += Wrapping(1);
+
+                    if nonce.0.is_multiple_of(128) {
+                        hashes_tried.fetch_add(128, Ordering::Relaxed);
+                        if shutdown.is_shutdown() {
+                            return Ok(());
+                        }
+                        if let Some(new_state) = job_channel.get_changed() {
+                            state = new_state.as_deref().cloned();
+                        }
+                    }
+
+                    if let Some(sleep_duration) = throttle {
+                        std::thread::sleep(sleep_duration)
                     }
                 }
+            }
+        })
+    }
+}
 
-                if let Some(sleep_duration) = throttle {
-                    std::thread::sleep(sleep_duration)
+impl StratumJobSink for StratumMinerManager {
+    fn process_job(
+        &mut self,
+        job_id: String,
+        pre_pow_hash: crate::Hash,
+        timestamp: u64,
+        block_target: crate::Hash,
+        share_target: crate::Hash,
+    ) {
+        StratumMinerManager::process_job(self, job_id, pre_pow_hash, timestamp, block_target, share_target);
+    }
+}
+
+#[derive(Clone)]
+pub struct StratumJobSlot {
+    job_channel: WatchSwap<pow::State>,
+    current_state_id: Arc<AtomicUsize>,
+}
+
+impl StratumJobSlot {
+    pub fn new() -> Self {
+        Self { job_channel: WatchSwap::empty(), current_state_id: Arc::new(AtomicUsize::new(0)) }
+    }
+}
+
+impl StratumJobSink for StratumJobSlot {
+    fn process_job(
+        &mut self,
+        job_id: String,
+        pre_pow_hash: crate::Hash,
+        timestamp: u64,
+        block_target: crate::Hash,
+        share_target: crate::Hash,
+    ) {
+        let id = self.current_state_id.fetch_add(1, Ordering::Relaxed);
+        self.job_channel.swap(pow::State::from_stratum(
+            id,
+            job_id,
+            pre_pow_hash,
+            timestamp,
+            block_target,
+            share_target,
+        ));
+    }
+}
+
+pub struct GpuStratumDevfundManager {
+    handle: Option<MinerHandler>,
+    logger_handle: JoinHandle<()>,
+}
+
+impl Drop for GpuStratumDevfundManager {
+    fn drop(&mut self) {
+        self.logger_handle.abort();
+        if let Some(handle) = self.handle.take() {
+            if handle.is_finished() {
+                if let Err(e) = handle.join().unwrap_or_else(|_| Err("GPU devfund worker panicked".into())) {
+                    warn!("GPU devfund worker exited: {e}");
+                }
+            }
+        }
+    }
+}
+
+impl GpuStratumDevfundManager {
+    pub fn new(
+        main_send: Sender<StratumCommand>,
+        dev_send: Sender<StratumCommand>,
+        main_slot: StratumJobSlot,
+        dev_slot: StratumJobSlot,
+        gpu_config: GpuConfig,
+        shutdown: ShutdownHandler,
+    ) -> Result<Self, Error> {
+        let hashes_tried = Arc::new(AtomicU64::new(0));
+        let logger_handle = task::spawn(MinerManager::log_hashrate(Arc::clone(&hashes_tried)));
+        let (startup_send, startup_recv) = std::sync::mpsc::sync_channel(1);
+        let handle = Self::launch(
+            main_send,
+            dev_send,
+            main_slot.job_channel,
+            dev_slot.job_channel,
+            hashes_tried,
+            gpu_config,
+            shutdown,
+            startup_send,
+        );
+        match startup_recv.recv_timeout(Duration::from_secs(120)) {
+            Ok(Ok(())) => Ok(Self { handle: Some(handle), logger_handle }),
+            Ok(Err(message)) => {
+                logger_handle.abort();
+                Err(message.into())
+            }
+            Err(e) => {
+                logger_handle.abort();
+                Err(format!("GPU initialization did not complete: {e}").into())
+            }
+        }
+    }
+
+    fn launch(
+        main_send: Sender<StratumCommand>,
+        dev_send: Sender<StratumCommand>,
+        mut main_jobs: WatchSwap<pow::State>,
+        mut dev_jobs: WatchSwap<pow::State>,
+        hashes_tried: Arc<AtomicU64>,
+        gpu_config: GpuConfig,
+        shutdown: ShutdownHandler,
+        startup_send: std::sync::mpsc::SyncSender<Result<(), String>>,
+    ) -> MinerHandler {
+        const DEVFUND_BATCH_PERIOD: u64 = 100;
+        const MIN_SHARE_SUBMIT_INTERVAL_MS: u64 = 250;
+
+        fn submit_hit(
+            send: &Sender<StratumCommand>,
+            state: &mut pow::State,
+            hit: GpuHit,
+            last_submit_ms: &AtomicU64,
+        ) -> Result<(), Error> {
+            state.nonce = hit.nonce;
+            let consensus_pow = state.calculate_pow();
+            if consensus_pow > state.share_target() {
+                debug!("GPU candidate failed consensus validation: nonce={:016x}", hit.nonce);
+                return Ok(());
+            }
+
+            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let previous = last_submit_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(previous) < MIN_SHARE_SUBMIT_INTERVAL_MS
+                || last_submit_ms.compare_exchange(previous, now_ms, Ordering::SeqCst, Ordering::Relaxed).is_err()
+            {
+                return Ok(());
+            }
+
+            let job_id = state.job_id.clone().ok_or("missing stratum job id")?;
+            let nonce = format!("{:016x}", hit.nonce);
+            send.blocking_send(StratumCommand::SubmitShare { job_id, nonce: nonce.clone() })?;
+            info!(
+                "Found a share: {} pow={} share_target={} block_target={}",
+                nonce,
+                consensus_pow.to_be_hex(),
+                state.share_target().to_be_hex(),
+                state.block_target().to_be_hex()
+            );
+            Ok(())
+        }
+
+        std::thread::spawn(move || {
+            let mut gpu = match GpuSearcher::new(&gpu_config) {
+                Ok(gpu) => {
+                    let _ = startup_send.send(Ok(()));
+                    gpu
+                }
+                Err(e) => {
+                    let message = format!("GPU initialization failed: {e}");
+                    let _ = startup_send.send(Err(message.clone()));
+                    return Err(message.into());
+                }
+            };
+            let mut nonce = Wrapping(thread_rng().next_u64());
+            let mut main_state = None;
+            let mut dev_state = None;
+            let mut batch_index = 0u64;
+            let main_last_submit = AtomicU64::new(0);
+            let dev_last_submit = AtomicU64::new(0);
+
+            info!("{} Stratum GPU scheduler active: 99% user / 1% devfund", gpu.name());
+            loop {
+                if main_state.is_none() {
+                    main_state = main_jobs.wait_for_change().as_deref().cloned();
+                }
+                if let Some(changed) = main_jobs.get_changed() {
+                    main_state = changed.as_deref().cloned();
+                }
+                if let Some(changed) = dev_jobs.get_changed() {
+                    dev_state = changed.as_deref().cloned();
+                }
+
+                let use_devfund = batch_index % DEVFUND_BATCH_PERIOD == DEVFUND_BATCH_PERIOD - 1 && dev_state.is_some();
+                let state = if use_devfund {
+                    dev_state.as_mut().expect("checked devfund state")
+                } else {
+                    let Some(state) = main_state.as_mut() else { continue };
+                    state
+                };
+
+                let hits = gpu.search(state, nonce.0, state.share_target())?;
+                let batch = gpu.batch_size() as u64;
+                nonce += Wrapping(batch);
+                hashes_tried.fetch_add(batch, Ordering::Relaxed);
+
+                let (send, last_submit) = if use_devfund {
+                    debug!("Mining scheduled GPU devfund batch");
+                    (&dev_send, &dev_last_submit)
+                } else {
+                    (&main_send, &main_last_submit)
+                };
+                for hit in hits {
+                    submit_hit(send, state, hit, last_submit)?;
+                }
+
+                batch_index = batch_index.wrapping_add(1);
+                if shutdown.is_shutdown() {
+                    return Ok(());
                 }
             }
         })

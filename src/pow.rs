@@ -7,6 +7,7 @@ use crate::{
     proto::{RpcBlock, RpcBlockHeader},
     target::{self, Uint256},
     Error,
+    Hash,
 };
 
 mod hasher;
@@ -23,6 +24,8 @@ pub struct State {
     block_target: Uint256,
     share_target: Uint256,
     block: Option<RpcBlock>,
+    pre_pow_hash: Uint256,
+    timestamp: u64,
     // PRE_POW_HASH || TIME || 32 zero byte padding; without NONCE
     hasher: PowHasher,
 }
@@ -71,7 +74,45 @@ impl State {
         let hasher = PowHasher::new(pre_pow_hash, timestamp);
         let matrix = Matrix::generate(pre_pow_hash);
 
-        Self { _id: id, job_id, matrix, nonce: 0, block_target, share_target, block, hasher }
+        Self { _id: id, job_id, matrix, nonce: 0, block_target, share_target, block, pre_pow_hash, timestamp, hasher }
+    }
+
+    #[inline(always)]
+    pub(crate) fn gpu_pow_state(&self) -> [u64; 25] {
+        self.hasher.words()
+    }
+
+    #[inline(always)]
+    pub(crate) fn gpu_matrix_bytes(&self) -> [u8; 64 * 64] {
+        self.matrix.as_u8_bytes()
+    }
+
+    #[inline(always)]
+    pub(crate) fn gpu_hash_header(&self) -> [u8; 72] {
+        let mut out = [0u8; 72];
+        out[..32].copy_from_slice(&self.pre_pow_hash.to_le_bytes());
+        out[32..40].copy_from_slice(&self.timestamp.to_le_bytes());
+        out
+    }
+
+    #[inline(always)]
+    pub(crate) fn gpu_matrix_u16_le_bytes(&self) -> [u8; 64 * 64 * 2] {
+        self.matrix.as_u16_le_bytes()
+    }
+
+    #[inline(always)]
+    pub(crate) fn stage1_for_nonce(&self, nonce: u64) -> Hash {
+        self.hasher.finalize_with_nonce(nonce)
+    }
+
+    #[inline(always)]
+    pub(crate) fn stage2_for_stage1(&self, stage1: Hash) -> Hash {
+        self.matrix.heavy_hash(stage1)
+    }
+
+    #[inline(always)]
+    pub(crate) fn stage3_for_stage2(&self, stage2: Hash) -> Hash {
+        HeavyHasher::hash(stage2)
     }
 
     #[inline(always)]
@@ -100,6 +141,94 @@ impl State {
         words[2] ^= stage3.to_le_u64()[2].rotate_left(7);
         words[3] ^= stage4.to_le_u64()[3].rotate_left(13) ^ self.nonce.rotate_left(13);
         Uint256::from_le_u64(words)
+    }
+
+    #[inline(always)]
+    pub(crate) fn calculate_pow_from_parts(
+        &self,
+        stage1: Hash,
+        stage2: Hash,
+        stage3: Hash,
+        nonce: u64,
+    ) -> Uint256 {
+        let stage4 = crate::pow::hasher::memory_hard_hash(stage3, stage1, nonce, self.block_target);
+
+        let mut final_state = blake2b_simd::Params::new().hash_length(32).key(b"ProofOfWorkHash").to_state();
+        final_state.update(&stage4.to_le_bytes());
+        final_state.update(&nonce.to_le_bytes());
+        final_state.update(&self.block_target.to_le_bytes());
+        let stage5 =
+            Uint256::from_le_bytes(final_state.finalize().as_bytes().try_into().expect("blake2b hash is 32 bytes"));
+
+        let mut words = stage5.to_le_u64();
+        words[0] ^= stage1.to_le_u64()[0].rotate_left(17);
+        words[1] ^= stage2.to_le_u64()[1].rotate_right(11);
+        words[2] ^= stage3.to_le_u64()[2].rotate_left(7);
+        words[3] ^= stage4.to_le_u64()[3].rotate_left(13) ^ nonce.rotate_left(13);
+        Uint256::from_le_u64(words)
+    }
+
+    #[inline(always)]
+    pub(crate) fn calculate_pow_from_gpu_stage4(
+        &self,
+        stage1: Hash,
+        stage2: Hash,
+        stage3: Hash,
+        stage4: Hash,
+        nonce: u64,
+    ) -> Uint256 {
+        let mut final_state = blake2b_simd::Params::new().hash_length(32).key(b"ProofOfWorkHash").to_state();
+        final_state.update(&stage4.to_le_bytes());
+        final_state.update(&nonce.to_le_bytes());
+        final_state.update(&self.block_target.to_le_bytes());
+        let stage5 =
+            Uint256::from_le_bytes(final_state.finalize().as_bytes().try_into().expect("blake2b hash is 32 bytes"));
+
+        let mut words = stage5.to_le_u64();
+        words[0] ^= stage1.to_le_u64()[0].rotate_left(17);
+        words[1] ^= stage2.to_le_u64()[1].rotate_right(11);
+        words[2] ^= stage3.to_le_u64()[2].rotate_left(7);
+        words[3] ^= stage4.to_le_u64()[3].rotate_left(13) ^ nonce.rotate_left(13);
+        Uint256::from_le_u64(words)
+    }
+
+    #[inline(always)]
+    pub(crate) fn cpu_stage4_from_parts(&self, stage1: Hash, stage3: Hash, nonce: u64) -> Hash {
+        crate::pow::hasher::memory_hard_hash(stage3, stage1, nonce, self.block_target)
+    }
+
+    #[inline(always)]
+    pub(crate) fn pow_match_from_parts(
+        &self,
+        stage1: Hash,
+        stage2: Hash,
+        stage3: Hash,
+        nonce: u64,
+    ) -> PowMatch {
+        let pow = self.calculate_pow_from_parts(stage1, stage2, stage3, nonce);
+        if pow <= self.block_target {
+            PowMatch::Block
+        } else if pow <= self.share_target {
+            PowMatch::Share
+        } else {
+            PowMatch::None
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn generate_block_if_pow_from_parts(
+        &self,
+        stage1: Hash,
+        stage2: Hash,
+        stage3: Hash,
+        nonce: u64,
+    ) -> Option<RpcBlock> {
+        matches!(self.pow_match_from_parts(stage1, stage2, stage3, nonce), PowMatch::Block).then(|| {
+            let mut block = self.block.clone().expect("RPC mining state must keep a block template");
+            let header = block.header.as_mut().expect("We checked that a header exists on creation");
+            header.nonce = nonce;
+            block
+        })
     }
 
     #[inline(always)]
@@ -286,7 +415,7 @@ mod tests {
         println!("stage4={}", stage4.to_be_hex());
         println!("pow={}", pow.to_be_hex());
 
-        assert_eq!(pow.to_be_hex(), "000382fb5b1c9028d630c4a00c5cb9fdbebca9fb83882e61c87f57b27656c22d");
+        assert_eq!(pow.to_be_hex(), "630967dab9ef03c17af0af81e78603ad34315ffa8fd36e2951b98214e02c682a");
     }
 
     #[test]

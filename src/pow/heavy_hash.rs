@@ -126,6 +126,30 @@ impl Matrix {
         product.iter_mut().zip(hash).for_each(|(p, h)| *p ^= h);
         HeavyHasher::hash(Hash::from_le_bytes(product))
     }
+
+    #[inline(always)]
+    pub(crate) fn as_u8_bytes(&self) -> [u8; 64 * 64] {
+        let mut out = [0u8; 64 * 64];
+        for (i, row) in self.0.iter().enumerate() {
+            for (j, val) in row.iter().enumerate() {
+                out[i * 64 + j] = (*val & 0x0F) as u8;
+            }
+        }
+        out
+    }
+
+    #[inline(always)]
+    pub(crate) fn as_u16_le_bytes(&self) -> [u8; 64 * 64 * 2] {
+        let mut out = [0u8; 64 * 64 * 2];
+        let mut offset = 0;
+        for row in self.0.iter() {
+            for val in row.iter() {
+                out[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+                offset += 2;
+            }
+        }
+        out
+    }
 }
 
 pub fn array_from_fn<F, T, const N: usize>(mut cb: F) -> [T; N]

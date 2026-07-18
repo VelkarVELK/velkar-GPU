@@ -62,6 +62,32 @@ pub struct Opt {
     /// Custom user agent suffix (max 20 characters)
     pub user_agent_suffix: Option<String>,
 
+    #[clap(long = "opencl-enable", display_order = 12)]
+    /// Enable the OpenCL GPU backend (AMD/NVIDIA)
+    pub opencl_enable: bool,
+    #[clap(long = "opencl-platform", display_order = 13)]
+    /// Choose the OpenCL platform index
+    pub opencl_platform: Option<u16>,
+    #[clap(long = "opencl-device", display_order = 14)]
+    /// Choose the OpenCL device index on the selected platform
+    pub opencl_device: Option<u16>,
+    #[clap(long = "opencl-workload", display_order = 15)]
+    /// GPU batch size in nonces per OpenCL dispatch
+    pub opencl_workload: Option<usize>,
+    #[clap(long = "opencl-jobs-per-block", display_order = 16)]
+    /// OpenCL jobs sharing one workgroup (advanced tuning)
+    pub opencl_jobs_per_block: Option<usize>,
+
+    #[clap(long = "cuda-enable", display_order = 17)]
+    /// Enable the native NVIDIA CUDA backend
+    pub cuda_enable: bool,
+    #[clap(long = "cuda-device", display_order = 18)]
+    /// Choose the CUDA device index
+    pub cuda_device: Option<u16>,
+    #[clap(long = "cuda-workload", display_order = 19)]
+    /// GPU batch size in nonces per CUDA dispatch
+    pub cuda_workload: Option<usize>,
+
     #[clap(skip)]
     mode: ConnectionMode,
 }
@@ -92,6 +118,12 @@ fn parse_devfund_percent(s: &str) -> Result<u16, &'static str> {
 
 impl Opt {
     pub fn process(&mut self) -> Result<(), Error> {
+        if self.opencl_enable && self.cuda_enable {
+            return Err("Use either --opencl-enable or --cuda-enable, not both".into());
+        }
+        if self.cuda_enable && !cfg!(feature = "cuda") {
+            return Err("This binary was built without CUDA support; rebuild with --features cuda".into());
+        }
         if self.velkard_address.is_empty() {
             self.velkard_address = "127.0.0.1".to_string();
         }

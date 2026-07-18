@@ -45,6 +45,11 @@ impl PowHasher {
         super::keccak::f1600(&mut self.0);
         Hash::new(self.0[..4].try_into().unwrap())
     }
+
+    #[inline(always)]
+    pub(super) fn words(&self) -> [u64; 25] {
+        self.0
+    }
 }
 
 impl HeavyHasher {

@@ -1,4 +1,4 @@
-use crate::{miner::StratumMinerManager, target, Error, ShutdownHandler};
+use crate::{miner::StratumJobSink, target, Error, ShutdownHandler};
 use log::{info, warn};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,10 +106,10 @@ impl StratumHandler {
         self.submit_tx.clone()
     }
 
-    pub async fn listen(
+    pub async fn listen<M: StratumJobSink>(
         &mut self,
         lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
-        miner: &mut StratumMinerManager,
+        miner: &mut M,
         submit_rx: &mut mpsc::Receiver<StratumCommand>,
         shutdown: ShutdownHandler,
     ) -> Result<(), Error> {
@@ -139,7 +139,7 @@ impl StratumHandler {
         Ok(())
     }
 
-    async fn handle_line(&mut self, line: &str, miner: &mut StratumMinerManager) -> Result<(), Error> {
+    async fn handle_line<M: StratumJobSink>(&mut self, line: &str, miner: &mut M) -> Result<(), Error> {
         let value: Value = serde_json::from_str(line)?;
 
         if let Some(method) = value.get("method").and_then(Value::as_str) {

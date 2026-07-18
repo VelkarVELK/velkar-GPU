@@ -110,9 +110,18 @@ impl VelkardHandler {
         match msg {
             Payload::NewBlockTemplateNotification(_) => self.client_get_block_template().await?,
             Payload::GetBlockTemplateResponse(template) => match (template.block, template.is_synced, template.error) {
-                (Some(b), true, None) => miner.process_block(Some(b))?,
-                (Some(b), false, None) if self.mine_when_not_synced => miner.process_block(Some(b))?,
-                (_, false, None) => miner.process_block(None)?,
+                (Some(b), true, None) => {
+                    info!("Received block template: synced=true");
+                    miner.process_block(Some(b))?
+                }
+                (Some(b), false, None) if self.mine_when_not_synced => {
+                    warn!("Received block template: synced=false, mining anyway because mine-when-not-synced is enabled");
+                    miner.process_block(Some(b))?
+                }
+                (_, false, None) => {
+                    warn!("Received block template: synced=false, skipping work");
+                    miner.process_block(None)?
+                }
                 (_, _, Some(e)) => warn!("GetTemplate returned with an error: {:?}", e),
                 (None, true, None) => error!("No block and No Error!"),
             },

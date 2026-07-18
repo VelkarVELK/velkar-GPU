@@ -1,0 +1,36 @@
+# Rust build output
+/target/
+
+# Local dependency/build staging
+/deps/
+
+# Reference miners and downloaded archives
+/kaspa-miner-main/
+/kaspa-miner-main.zip
+
+# Superseded local documentation draft
+/README-EN.md
+
+# Local benchmarks and diagnostics
+/*.log
+/*.out
+/*.err
+/*.err.log
+/*.out.log
+
+# IDE and operating-system files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Secrets and local configuration
+.env
+.env.*
+*.key
+*.pem
+wallet*.json
+vault*.json
